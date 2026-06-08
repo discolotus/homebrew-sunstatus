@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  audit:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Homebrew
+        uses: Homebrew/actions/setup-homebrew@master
+      - name: Tap checkout
+        run: brew tap discolotus/sunstatus "$GITHUB_WORKSPACE"
+      - name: Tap syntax
+        run: brew test-bot --only-tap-syntax
+      - name: Cask audit
+        run: brew audit --cask --new sunstatus
