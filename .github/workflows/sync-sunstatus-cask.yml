@@ -1,0 +1,136 @@
+name: Sync SunStatus Cask
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "SunStatus release tag to sync, for example v0.4.0. Defaults to latest."
+        required: false
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-sunstatus-cask
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out tap
+        uses: actions/checkout@v6
+
+      - name: Resolve SunStatus release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          tag="$INPUT_TAG"
+          if [[ -z "$tag" ]]; then
+            tag="$(gh release view --repo discolotus/SunStatus --json tagName --jq .tagName)"
+          fi
+
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must look like v1.2.3, got: $tag" >&2
+            exit 1
+          fi
+
+          release_dir="$RUNNER_TEMP/sunstatus-release"
+          rm -rf "$release_dir"
+          mkdir -p "$release_dir"
+          gh release download "$tag" \
+            --repo discolotus/SunStatus \
+            --pattern SHA256SUMS \
+            --dir "$release_dir" \
+            --clobber
+
+          dmg_sha="$(awk '$2 ~ /SunStatus\.dmg$/ { print $1 }' "$release_dir/SHA256SUMS")"
+          if [[ ! "$dmg_sha" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Could not find a valid SunStatus.dmg SHA-256 in SHA256SUMS" >&2
+            exit 1
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "version=${tag#v}"
+            echo "dmg_sha=$dmg_sha"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved $tag with DMG SHA-256 $dmg_sha"
+
+      - name: Update cask
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          DMG_SHA: ${{ steps.release.outputs.dmg_sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path("Casks/sunstatus.rb")
+          text = path.read_text()
+          version = os.environ["VERSION"]
+          dmg_sha = os.environ["DMG_SHA"]
+
+          replacements = [
+              (
+                  r'  version "[^"]+"',
+                  f'  version "{version}"',
+              ),
+              (
+                  r'  sha256 "[0-9a-f]+"',
+                  f'  sha256 "{dmg_sha}"',
+              ),
+              (
+                  r'  url "[^"]+"',
+                  '  url "https://github.com/discolotus/SunStatus/releases/download/v#{version}/SunStatus.dmg"',
+              ),
+          ]
+
+          for pattern, replacement in replacements:
+              text, count = re.subn(pattern, replacement, text, count=1)
+              if count != 1:
+                  raise SystemExit(f"Expected to replace exactly one match for {pattern!r}, replaced {count}")
+
+          path.write_text(text)
+          PY
+
+      - name: Stop if already current
+        id: diff
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- Casks/sunstatus.rb; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Cask already matches v${{ steps.release.outputs.version }}."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Homebrew
+        if: steps.diff.outputs.changed == 'true'
+        uses: Homebrew/actions/setup-homebrew@main
+
+      - name: Validate tap
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          brew test-bot --only-tap-syntax
+          brew audit --cask sunstatus
+
+      - name: Commit cask update
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/sunstatus.rb
+          git commit -m "Update SunStatus cask to v${{ steps.release.outputs.version }}"
+          git push
